@@ -38,6 +38,16 @@ UNSAVED_MARKER = "*"
 SEARCH_MODULES_BUTTON_NAME = "Search Modules"
 MODULE_SEARCH_EDIT_NAME = "Search for Module Name, Application Name or Author"
 OPEN_BUTTON_NAME = "Open"
+MANAGE_DEPENDENCIES_TITLE = "Manage Dependencies"
+DEPENDENCY_MODULE_SEARCH_EDIT_NAME = "Search modules"
+DEPENDENCY_ELEMENT_SEARCH_EDIT_NAME = "Search public elements"
+APPLY_BUTTON_NAME = "Apply"
+ALL_FILTER_BUTTON_NAME = "All"
+REFRESH_ALL_BUTTON_NAME = "Refresh all"
+NO_BUTTON_NAME = "No"
+# Shown after Apply when the module still has outdated/missing references.
+OUTDATED_REFERENCES_TITLE = "Modified or missing references found"
+EXTENSION_TAG = "(extension)"
 CANCEL_BUTTON_NAME = "Cancel"
 
 

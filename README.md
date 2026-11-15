@@ -18,6 +18,8 @@ OutSystems MCP. Background: [docs/phase1-findings.md](docs/phase1-findings.md),
 | `open_module(module_name)` | Opens the module with this exact name (case-insensitive) and verifies its tab; brings an already-open module to the front. Refuses to open a new module when 10 are already open |
 | `get_open_modules()` | Number of open modules, the limit (10), `can_open_more`, and each open module's name, application, unsaved flag and whether it is in front |
 | `close_module(module_name)` | Closes an open module's tab and verifies it is gone. Refuses modules with unsaved changes |
+| `add_dependency(module_name, dependency_name)` | Adds a dependency on **all public elements** of another module/extension through *Manage Dependencies* (Ctrl+Q): searches, selects the row, picks the elements panel's *All* filter, ticks the module, presses *Apply* and waits for the dialog to close. The module must be open. Returns `applied` or `already_present` (also when only some elements are referenced). Optional `elements` adds only those public elements (exact names) |
+| `remove_dependency(module_name, dependency_name)` | Same dialog, unticks the dependency and applies. Returns `applied` or `not_a_dependency`; optional `elements` removes only those. If Service Studio asks about outdated references after Apply, the server answers No, presses *Refresh all* and applies again. Any other dialog is reported as `unexpected_dialog` |
 
 ### Open-module limit
 

@@ -27,10 +27,16 @@ from os_module_navigator.automation.driver import (
     ServiceStudioDriver,
     UiState,
 )
+from os_module_navigator.automation.live import DependencyRoot
 from os_module_navigator.config import NavigatorConfig
 from os_module_navigator.errors import (
+    AmbiguousDependencyElementError,
+    AmbiguousDependencyError,
     AmbiguousModuleError,
     AutomationTimeoutError,
+    DependencyChangeFailedError,
+    DependencyElementNotFoundError,
+    DependencyNotFoundError,
     ModuleNotFoundInEnvironmentError,
     ModuleNotOpenError,
     NavigatorError,
@@ -40,10 +46,12 @@ from os_module_navigator.errors import (
     TooManyOpenModulesError,
     UnexpectedDialogError,
     UnsavedChangesError,
+    WrongDependencySelectedError,
     WrongModuleOpenedError,
 )
 from os_module_navigator.models import (
     CloseModuleResult,
+    DependencyChangeResult,
     ModuleInfo,
     OpenModule,
     OpenModuleResult,
@@ -57,6 +65,9 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 AUTOMATION_BACKEND = "pywinauto-uia"
+REFRESH_NOTE = (
+    " Service Studio reported outdated references, so all references were refreshed first."
+)
 
 
 def _normalize(text: str) -> str:
@@ -259,6 +270,317 @@ class DesktopGUINavigator:
             if self._clock() > deadline:
                 raise AutomationTimeoutError(f"{module_name!r} was still open after closing it.")
 
+    # --- dependencies ----------------------------------------------------------
+    def _dependency_rows(self, query: str) -> list[tuple[str, bool]]:
+        """Filter Manage Dependencies' module list and wait until it settles."""
+        before = self.driver.read_dependency_rows()
+        self.driver.set_dependency_search(query)
+        needle = _normalize(query)
+        deadline = self._clock() + self.config.search_settle_timeout_s
+        previous: list[tuple[str, bool]] | None = None
+        stable = 0
+        while True:
+            self._sleep(self.config.poll_interval_s)
+            rows = self.driver.read_dependency_rows()
+            stable = stable + 1 if rows == previous else 0
+            previous = rows
+            matches = bool(rows) and all(needle in _normalize(name) for name, _ in rows)
+            if (matches and stable >= 1) or (rows != before and stable >= 2):
+                return rows
+            if self._clock() > deadline:
+                raise AutomationTimeoutError("Dependency list did not update in time.")
+
+    def _wait_tab_selected(self, module_name: str) -> None:
+        deadline = self._clock() + 5.0
+        while self._clock() <= deadline:
+            for _, tab, caption in _module_tabs(self.driver.read_state()):
+                if tab.selected and ss.same_module_name(caption.name, module_name):
+                    return
+            self._sleep(self.config.poll_interval_s)
+        raise AutomationTimeoutError(f"The tab of {module_name!r} could not be brought to front.")
+
+    def _stable_dependency_root(self) -> DependencyRoot | None:
+        """Read the elements tree root once it stops changing (Chromium renders lazily)."""
+        previous: tuple[str, int] | None = None
+        root: DependencyRoot | None = None
+        for _ in range(6):
+            self._sleep(self.config.poll_interval_s)
+            root = self.driver.read_dependency_root()
+            current = (root.label, root.state) if root else None
+            if current is not None and current == previous:
+                return root
+            previous = current
+        return root
+
+    def _select_dependency(self, row_name: str, rendered_rows: int) -> DependencyRoot:
+        """Move down the module list until the elements tree shows ``row_name``.
+
+        The first Down only moves the focus into the list; each further Down selects
+        the next row. Reading the tree after every key makes the selection verified
+        instead of counted, so a wrong row is never changed.
+        """
+        self.driver.focus_dependency_search()
+        seen = ""
+        for _ in range(rendered_rows + 2):
+            self.driver.press_dependency_key("{DOWN}", self.config.key_delay_s)
+            root = self._stable_dependency_root()
+            if root is None:
+                continue
+            seen = root.label
+            if _normalize(root.label) == _normalize(row_name):
+                return root
+        raise WrongDependencySelectedError(
+            f"Could not select {row_name!r} (last selected: {seen!r}); nothing was changed."
+        )
+
+    def _set_dependency_checked(self, want: int) -> None:
+        for _ in range(3):
+            root = self.driver.read_dependency_root()
+            if root is not None and root.state == want:
+                return
+            self.driver.toggle_dependency_root(self.config.key_delay_s)
+            self._sleep(self.config.poll_interval_s)
+        root = self.driver.read_dependency_root()
+        if root is None or root.state != want:
+            raise DependencyChangeFailedError(
+                "Could not change the dependency's checkbox; nothing was applied."
+            )
+
+    def _wait_dependencies_applied(self) -> bool:
+        """Wait for Apply to finish. Returns True if outdated references had to be refreshed.
+
+        When the module still has outdated or missing references Service Studio asks
+        whether to proceed "keeping outdated definitions". We answer No, press
+        *Refresh all* and Apply again (once), so no stale definition is left behind.
+        """
+        deadline = self._clock() + self.config.dependency_apply_timeout_s
+        refreshed = False
+        while True:
+            self._sleep(self.config.poll_interval_s)
+            dialogs = self.driver.read_state().dialogs
+            if ss.MANAGE_DEPENDENCIES_TITLE not in dialogs and not any(
+                d in ss.TRANSIENT_DIALOG_TITLES for d in dialogs
+            ):
+                return refreshed
+            if ss.OUTDATED_REFERENCES_TITLE in dialogs and not refreshed:
+                self.driver.dismiss_outdated_references_prompt()
+                self._sleep(self.config.poll_interval_s)
+                self.driver.press_dependencies_refresh_all()
+                self._sleep(self.config.poll_interval_s * 2)
+                self.driver.press_dependencies_apply()
+                refreshed = True
+                continue
+            unexpected = [
+                d
+                for d in dialogs
+                if d != ss.MANAGE_DEPENDENCIES_TITLE and d not in ss.TRANSIENT_DIALOG_TITLES
+            ]
+            if unexpected:
+                raise UnexpectedDialogError(
+                    f"Service Studio is showing a dialog ({unexpected[0]!r}) after Apply. "
+                    "Please handle it in Service Studio."
+                )
+            if self._clock() > deadline:
+                raise AutomationTimeoutError("Manage Dependencies was still open after Apply.")
+
+    def _element_rows(self, query: str) -> list[tuple[str, int]]:
+        """Filter the elements tree and return ``(label, state)`` of the rows below the module."""
+        before = [r.label for r in self.driver.read_dependency_checkboxes()]
+        self.driver.set_element_search(query)
+        deadline = self._clock() + self.config.search_settle_timeout_s
+        previous: list[tuple[str, int]] | None = None
+        stable = 0
+        while True:
+            self._sleep(self.config.poll_interval_s)
+            boxes = self.driver.read_dependency_checkboxes()
+            rows = [(r.label, r.state) for r in boxes[1:]]
+            stable = stable + 1 if rows == previous else 0
+            previous = rows
+            changed = [r.label for r in boxes] != before
+            if (changed and stable >= 1) or stable >= 3:
+                return rows
+            if self._clock() > deadline:
+                raise AutomationTimeoutError("The elements list did not update in time.")
+
+    def _set_element(self, name: str, want: int) -> bool:
+        """Make one element's checkbox ``want``. Returns True when it had to be toggled."""
+        rows = self._element_rows(name)
+        exact = [i for i, (label, _) in enumerate(rows) if _normalize(label) == _normalize(name)]
+        if not exact:
+            raise DependencyElementNotFoundError(
+                f"No element named {name!r} was found in this dependency.",
+                suggestions=[label for label, _ in rows if name.casefold() in label.casefold()][
+                    :10
+                ],
+            )
+        if len(exact) > 1:
+            raise AmbiguousDependencyElementError(
+                f"{len(exact)} rows are named {name!r}.",
+                candidates=[rows[i][0] for i in exact],
+            )
+        label, state = rows[exact[0]]
+        if state == want:
+            return False
+        for _ in range(3):
+            self.driver.toggle_dependency_checkbox(label, self.config.key_delay_s)
+            self._sleep(self.config.poll_interval_s)
+            current = [(r.label, r.state) for r in self.driver.read_dependency_checkboxes()[1:]]
+            now = [st for lab, st in current if lab == label]
+            if len(now) == 1 and now[0] == want:
+                return True
+        raise DependencyChangeFailedError(
+            f"Could not change the checkbox of {label!r}; nothing was applied."
+        )
+
+    def _change_elements(
+        self, module_name: str, row_name: str, elements: list[str], *, add: bool, action: str
+    ) -> DependencyChangeResult:
+        want = 1 if add else 0
+        changed = [e for e in elements if self._set_element(e, want)]
+        if not changed:
+            self._cancel_dependencies_quietly()
+            if add:
+                status, text = "already_present", "already included"
+            else:
+                status, text = "not_a_dependency", "not included"
+            return DependencyChangeResult(
+                module_name=module_name,
+                dependency_name=row_name,
+                action=action,
+                elements=elements,
+                status=status,
+                message=f"{', '.join(elements)} {text} in {row_name!r} in {module_name!r}; "
+                "nothing was changed.",
+            )
+        self.driver.set_element_search("")
+        self.driver.press_dependencies_apply()
+        refreshed = self._wait_dependencies_applied()
+        note = REFRESH_NOTE if refreshed else ""
+        verb = "added to" if add else "removed from"
+        return DependencyChangeResult(
+            module_name=module_name,
+            dependency_name=row_name,
+            action=action,
+            elements=changed,
+            status="applied",
+            message=f"{', '.join(changed)} of {row_name!r} {verb} the dependencies of "
+            f"{module_name!r}.{note}",
+        )
+
+    def _cancel_dependencies_quietly(self) -> None:
+        try:
+            self.driver.cancel_dependencies_dialog()
+        except NavigatorError:
+            log.warning("Could not close the Manage Dependencies dialog.")
+
+    def change_dependency(
+        self,
+        module_name: str,
+        dependency_name: str,
+        *,
+        add: bool,
+        elements: list[str] | None = None,
+    ) -> DependencyChangeResult:
+        module_name = self._validate(module_name, "Module name")
+        dependency_name = self._validate(dependency_name, "Dependency name")
+        wanted = list(dict.fromkeys(self._validate(e, "Element name") for e in elements or []))
+        action = "add" if add else "remove"
+        state = self._ready_state(require_connected=False)
+        tabs = _module_tabs(state)
+        match = next((m for m in tabs if ss.same_module_name(m[2].name, module_name)), None)
+        if match is None:
+            raise ModuleNotOpenError(
+                f"No open module is named {module_name!r}.",
+                open_modules=[c.name for _, _, c in tabs],
+            )
+        index, tab, caption = match
+        if not tab.selected:
+            self.driver.select_tab(index)
+            self._wait_tab_selected(caption.name)
+        self.driver.open_dependencies_dialog(
+            self.config.dialog_open_timeout_s, self.config.poll_interval_s
+        )
+        try:
+            return self._change_in_dialog(
+                caption.name, dependency_name, add=add, action=action, elements=wanted
+            )
+        except BaseException:
+            self._cancel_dependencies_quietly()
+            raise
+
+    def _change_in_dialog(
+        self,
+        module_name: str,
+        dependency_name: str,
+        *,
+        add: bool,
+        action: str,
+        elements: list[str],
+    ) -> DependencyChangeResult:
+        rows = self._dependency_rows(dependency_name)
+        exact = [
+            i for i, (name, _) in enumerate(rows) if ss.same_module_name(name, dependency_name)
+        ]
+        if not exact:
+            raise DependencyNotFoundError(
+                f"No module named {dependency_name!r} is available as a dependency.",
+                suggestions=[name for name, _ in rows[:10]],
+            )
+        if len(exact) > 1:
+            raise AmbiguousDependencyError(
+                f"{len(exact)} entries are named {dependency_name!r}.",
+                candidates=[
+                    f"{rows[i][0]} (extension)" if rows[i][1] else rows[i][0] for i in exact
+                ],
+            )
+        row_name = rows[exact[0]][0]
+        self._select_dependency(row_name, len(rows))
+        # The elements panel may start on 'Modified or missing', which hides them.
+        self.driver.show_all_dependency_elements()
+        root = self._stable_dependency_root()
+        if root is None or _normalize(root.label) != _normalize(row_name):
+            raise WrongDependencySelectedError(
+                f"Could not read {row_name!r}'s elements; nothing was changed."
+            )
+        if elements:
+            return self._change_elements(module_name, row_name, elements, add=add, action=action)
+        want = 1 if add else 0
+        # Partially selected (state 2) already counts as a dependency: adding all of its
+        # elements would change which ones the module consumes. Refresh/Remove cover it.
+        present = root.state in (1, 2)
+        if (present and add) or (root.state == 0 and not add):
+            self._cancel_dependencies_quietly()
+            if add:
+                return DependencyChangeResult(
+                    module_name=module_name,
+                    dependency_name=row_name,
+                    action=action,
+                    status="already_present",
+                    message=f"{row_name!r} is already a dependency of {module_name!r}"
+                    + (" (only some of its elements)" if root.state == 2 else "")
+                    + "; nothing was changed.",
+                )
+            return DependencyChangeResult(
+                module_name=module_name,
+                dependency_name=row_name,
+                action=action,
+                status="not_a_dependency",
+                message=f"{row_name!r} is not a dependency of {module_name!r}; "
+                "nothing was changed.",
+            )
+        self._set_dependency_checked(want)
+        self.driver.press_dependencies_apply()
+        refreshed = self._wait_dependencies_applied()
+        note = REFRESH_NOTE if refreshed else ""
+        verb = "added to" if add else "removed from"
+        return DependencyChangeResult(
+            module_name=module_name,
+            dependency_name=row_name,
+            action=action,
+            status="applied",
+            message=f"{row_name!r} was {verb} the dependencies of {module_name!r}.{note}",
+        )
+
     def search(self, query: str) -> SearchResult:
         query = self._validate(query, "Query")
         state = self._ready_state()
@@ -393,6 +715,24 @@ class DesktopGUIProvider:
 
     async def close_module(self, module_name: str) -> CloseModuleResult:
         return await self._run(lambda: self._navigator.close(module_name))
+
+    async def add_dependency(
+        self, module_name: str, dependency_name: str, elements: list[str] | None = None
+    ) -> DependencyChangeResult:
+        return await self._run(
+            lambda: self._navigator.change_dependency(
+                module_name, dependency_name, add=True, elements=elements
+            )
+        )
+
+    async def remove_dependency(
+        self, module_name: str, dependency_name: str, elements: list[str] | None = None
+    ) -> DependencyChangeResult:
+        return await self._run(
+            lambda: self._navigator.change_dependency(
+                module_name, dependency_name, add=False, elements=elements
+            )
+        )
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

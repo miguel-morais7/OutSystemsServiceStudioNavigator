@@ -81,3 +81,18 @@ class CloseModuleResult(BaseModel):
     status: str = Field(default="closed")
     message: str
     open_modules_count: int = Field(description="Number of module tabs still open.")
+
+
+class DependencyChangeResult(BaseModel):
+    module_name: str
+    dependency_name: str
+    action: str = Field(description="'add' or 'remove'.")
+    elements: list[str] = Field(
+        default_factory=list,
+        description="Elements that were changed; empty means the whole module.",
+    )
+    status: str = Field(
+        description="'applied', 'already_present' (add: nothing to do) or "
+        "'not_a_dependency' (remove: nothing to do)."
+    )
+    message: str
