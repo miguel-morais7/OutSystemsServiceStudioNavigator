@@ -207,6 +207,14 @@ class FakeDriver:
             current = self.root_states.get(self.deps_selected, 0)
             self.root_states[self.deps_selected] = 0 if current else 1
 
+    def read_dependencies_loading(self):
+        self.calls.append(("read_dependencies_loading",))
+        loading = getattr(self, "loading_reads", 0)
+        if loading > 0:
+            self.loading_reads = loading - 1
+            return "Processing... (44%)"
+        return None
+
     def press_dependencies_refresh_all(self):
         self.calls.append(("press_dependencies_refresh_all",))
 
@@ -786,3 +794,36 @@ def test_outdated_prompt_that_keeps_coming_back_is_reported():
     driver.root_states["OutSystemsUI"] = 1
     with pytest.raises(UnexpectedDialogError):
         nav.change_dependency("M1", "OutSystemsUI", add=False)
+
+
+def test_waits_for_manage_dependencies_to_finish_loading_before_searching():
+    driver, nav = deps_nav()
+    driver._deps_setup()
+    driver.loading_reads = 6
+    result = nav.change_dependency("M1", "OutSystemsUI", add=True)
+    assert result.status == "applied"
+    names = [c[0] for c in driver.calls]
+    assert (
+        names.index("set_dependency_search")
+        > max(i for i, n in enumerate(names) if n == "read_dependencies_loading") - 3
+    )
+    # nothing was cancelled while it was loading
+    assert not driver.called("cancel_dependencies_dialog")
+
+
+def test_progress_dialog_titles_are_transient():
+    assert ss.is_transient_dialog("Progress")
+    assert ss.is_transient_dialog("Processing... (44%)")
+    assert not ss.is_transient_dialog("Manage Dependencies")
+    assert ss.LOADING_TEXT.search("Processing... (44%)")
+    assert not ss.LOADING_TEXT.search("OutSystemsCharts")
+
+
+def test_loading_that_never_finishes_times_out_with_a_clear_error():
+    driver, nav = deps_nav(dependency_load_timeout_s=3)
+    driver._deps_setup()
+    driver.loading_reads = 10_000
+    with pytest.raises(AutomationTimeoutError) as err:
+        nav.change_dependency("M1", "OutSystemsUI", add=True)
+    assert "still loading" in str(err.value)
+    assert not driver.called("set_dependency_search")

@@ -79,6 +79,10 @@ remove_dependency does the opposite. To refresh existing references use the
 official omlRefreshReferences tool. After adding, call the official listApps
 to confirm the new reference. Do not call these in the middle of an
 applyModelApiCode chain: merge first, then change dependencies.
+Manage Dependencies can take minutes to load ("Processing... 44%"): the tools wait
+for it to finish and never close it while it loads. Call ONE dependency tool at a
+time and wait for its result; never run two in parallel or retry while one is
+still running.
 These tools never save or publish modules, and close only modules with
 no unsaved changes. open_module briefly brings Service Studio to the
 foreground and sends Up/Down keys to its search dialog, so avoid typing in

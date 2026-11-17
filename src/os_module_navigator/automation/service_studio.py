@@ -32,6 +32,16 @@ DIALOG_UIA_CLASS = "DialogWindow"
 OPEN_FROM_ENVIRONMENT_TITLE = "Open from Environment"
 # Dialogs Service Studio shows briefly while loading; wait them out instead of failing.
 TRANSIENT_DIALOG_TITLES: frozenset[str] = frozenset({"Progress"})
+TRANSIENT_DIALOG_PREFIXES: tuple[str, ...] = ("Progress", "Processing", "Loading")
+# In-dialog loading indicators, e.g. "Processing... (44%)" or "Loading".
+LOADING_TEXT = re.compile(r"^\s*(Processing|Loading)\b|\(\s*\d+\s*%\s*\)|^\s*\d+\s*%\s*$")
+
+
+def is_transient_dialog(title: str) -> bool:
+    """True for progress dialogs Service Studio shows while it works ("Processing... (44%)")."""
+    return title in TRANSIENT_DIALOG_TITLES or title.startswith(TRANSIENT_DIALOG_PREFIXES)
+
+
 SHELL_TABS_AUTOMATION_ID = "tabs"
 WEBVIEW_WIN32_CLASS = "Chrome_RenderWidgetHostHWND"
 UNSAVED_MARKER = "*"

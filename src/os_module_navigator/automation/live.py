@@ -306,3 +306,15 @@ def dependency_checkboxes(webview_hwnd: int) -> list[DependencyCheckbox]:
     except Exception:
         return []
     return rows
+
+
+def dependencies_loading(webview_hwnd: int) -> str | None:
+    """The loading text shown inside Manage Dependencies ("Processing... (44%)"), if any."""
+    try:
+        for text in descendants_robust(element_info(webview_hwnd), "Text"):
+            name = str(text.name or "")
+            if name and _non_empty(text) and ss.LOADING_TEXT.search(name):
+                return name.strip()
+    except Exception:
+        return None
+    return None

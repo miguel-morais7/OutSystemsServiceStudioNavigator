@@ -53,6 +53,7 @@ class ServiceStudioDriver(Protocol):
     def read_dependency_root(self) -> live.DependencyRoot | None: ...
     def toggle_dependency_root(self, key_delay_s: float) -> None: ...
     def press_dependencies_apply(self) -> None: ...
+    def read_dependencies_loading(self) -> str | None: ...
     def press_dependencies_refresh_all(self) -> None: ...
     def dismiss_outdated_references_prompt(self) -> None: ...
     def cancel_dependencies_dialog(self) -> None: ...
@@ -150,13 +151,13 @@ class LiveServiceStudioDriver:
             dialogs = [w for w in self._windows() if w.role is ss.WindowRole.DIALOG]
             titles = [w.title for w in dialogs]
             if ss.OPEN_FROM_ENVIRONMENT_TITLE in titles and not any(
-                t in ss.TRANSIENT_DIALOG_TITLES for t in titles
+                ss.is_transient_dialog(t) for t in titles
             ):
                 return "open"
             unexpected = [
                 t
                 for t in titles
-                if t not in ss.TRANSIENT_DIALOG_TITLES and t != ss.OPEN_FROM_ENVIRONMENT_TITLE
+                if not ss.is_transient_dialog(t) and t != ss.OPEN_FROM_ENVIRONMENT_TITLE
             ]
             if unexpected:
                 raise UnexpectedDialogError(
@@ -291,12 +292,16 @@ class LiveServiceStudioDriver:
         self._press_open_shortcut(main.handle.hwnd)
         started = time.monotonic()
         deadline = started + timeout_s
+        hard_deadline = started + max(timeout_s, 600.0)
         retried = False
         while time.monotonic() < deadline:
             dialogs = [w for w in self._windows() if w.role is ss.WindowRole.DIALOG]
             titles = [w.title for w in dialogs]
+            if any(ss.is_transient_dialog(t) for t in titles):
+                # Service Studio is still working ("Processing... (44%)"): keep waiting.
+                deadline = min(hard_deadline, max(deadline, time.monotonic() + timeout_s))
             if ss.MANAGE_DEPENDENCIES_TITLE in titles and not any(
-                t in ss.TRANSIENT_DIALOG_TITLES for t in titles
+                ss.is_transient_dialog(t) for t in titles
             ):
                 # Give the web content a moment to render its first rows.
                 time.sleep(poll_s)
@@ -304,7 +309,7 @@ class LiveServiceStudioDriver:
             unexpected = [
                 t
                 for t in titles
-                if t not in ss.TRANSIENT_DIALOG_TITLES and t != ss.MANAGE_DEPENDENCIES_TITLE
+                if not ss.is_transient_dialog(t) and t != ss.MANAGE_DEPENDENCIES_TITLE
             ]
             if unexpected:
                 raise UnexpectedDialogError(
@@ -388,6 +393,12 @@ class LiveServiceStudioDriver:
 
     def press_dependencies_apply(self) -> None:
         actions.invoke(self._deps_element("Button", ss.APPLY_BUTTON_NAME))
+
+    def read_dependencies_loading(self) -> str | None:
+        if self._deps_dialog() is None:
+            return None
+        _, webview = self._require_deps_dialog()
+        return live.dependencies_loading(webview)
 
     def press_dependencies_refresh_all(self) -> None:
         actions.invoke(self._deps_element("Button", ss.REFRESH_ALL_BUTTON_NAME))

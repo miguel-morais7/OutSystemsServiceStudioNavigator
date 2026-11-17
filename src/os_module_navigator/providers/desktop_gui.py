@@ -128,9 +128,7 @@ class DesktopGUINavigator:
     def _ready_state(self, *, require_connected: bool = True) -> UiState:
         state = self.driver.read_state()
         deadline = self._clock() + self.config.dialog_open_timeout_s
-        while (
-            any(d in ss.TRANSIENT_DIALOG_TITLES for d in state.dialogs) and self._clock() < deadline
-        ):
+        while any(ss.is_transient_dialog(d) for d in state.dialogs) and self._clock() < deadline:
             self._sleep(self.config.poll_interval_s)
             state = self.driver.read_state()
         if not state.running:
@@ -261,7 +259,7 @@ class DesktopGUINavigator:
                     message="The module tab was closed.",
                     open_modules_count=len(remaining),
                 )
-            unexpected = [d for d in state.dialogs if d not in ss.TRANSIENT_DIALOG_TITLES]
+            unexpected = [d for d in state.dialogs if not ss.is_transient_dialog(d)]
             if unexpected:
                 raise UnexpectedDialogError(
                     f"Service Studio showed a dialog ({unexpected[0]!r}) while closing "
@@ -271,6 +269,32 @@ class DesktopGUINavigator:
                 raise AutomationTimeoutError(f"{module_name!r} was still open after closing it.")
 
     # --- dependencies ----------------------------------------------------------
+    def _wait_dependencies_loaded(self) -> None:
+        """Wait until Manage Dependencies has finished loading ("Processing... (44%)").
+
+        Searching or cancelling while it still loads makes the module look missing,
+        so nothing is read or changed until two checks in a row show no progress.
+        """
+        deadline = self._clock() + self.config.dependency_load_timeout_s
+        idle = 0
+        last = ""
+        while True:
+            transient = [d for d in self.driver.read_state().dialogs if ss.is_transient_dialog(d)]
+            indicator = self.driver.read_dependencies_loading()
+            if transient or indicator:
+                idle = 0
+                last = indicator or transient[0]
+            else:
+                idle += 1
+                if idle >= 2:
+                    return
+            if self._clock() > deadline:
+                raise AutomationTimeoutError(
+                    f"Manage Dependencies was still loading ({last!r}) after "
+                    f"{self.config.dependency_load_timeout_s:.0f}s."
+                )
+            self._sleep(self.config.poll_interval_s)
+
     def _dependency_rows(self, query: str) -> list[tuple[str, bool]]:
         """Filter Manage Dependencies' module list and wait until it settles."""
         before = self.driver.read_dependency_rows()
@@ -287,6 +311,8 @@ class DesktopGUINavigator:
             matches = bool(rows) and all(needle in _normalize(name) for name, _ in rows)
             if (matches and stable >= 1) or (rows != before and stable >= 2):
                 return rows
+            if self.driver.read_dependencies_loading():
+                deadline = self._clock() + self.config.search_settle_timeout_s
             if self._clock() > deadline:
                 raise AutomationTimeoutError("Dependency list did not update in time.")
 
@@ -359,7 +385,7 @@ class DesktopGUINavigator:
             self._sleep(self.config.poll_interval_s)
             dialogs = self.driver.read_state().dialogs
             if ss.MANAGE_DEPENDENCIES_TITLE not in dialogs and not any(
-                d in ss.TRANSIENT_DIALOG_TITLES for d in dialogs
+                ss.is_transient_dialog(d) for d in dialogs
             ):
                 return refreshed
             if ss.OUTDATED_REFERENCES_TITLE in dialogs and not refreshed:
@@ -373,7 +399,7 @@ class DesktopGUINavigator:
             unexpected = [
                 d
                 for d in dialogs
-                if d != ss.MANAGE_DEPENDENCIES_TITLE and d not in ss.TRANSIENT_DIALOG_TITLES
+                if d != ss.MANAGE_DEPENDENCIES_TITLE and not ss.is_transient_dialog(d)
             ]
             if unexpected:
                 raise UnexpectedDialogError(
@@ -517,6 +543,7 @@ class DesktopGUINavigator:
         action: str,
         elements: list[str],
     ) -> DependencyChangeResult:
+        self._wait_dependencies_loaded()
         rows = self._dependency_rows(dependency_name)
         exact = [
             i for i, (name, _) in enumerate(rows) if ss.same_module_name(name, dependency_name)
