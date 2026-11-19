@@ -13,7 +13,7 @@ from typing import Any
 import win32gui
 
 from os_module_navigator.automation import service_studio as ss
-from os_module_navigator.automation.uia import ElementNode, snapshot_handle
+from os_module_navigator.automation.uia import ElementNode, snapshot_handle, snapshot_tree
 from os_module_navigator.automation.windows import (
     WindowHandle,
     find_process_ids,
@@ -318,3 +318,124 @@ def dependencies_loading(webview_hwnd: int) -> str | None:
     except Exception:
         return None
     return None
+
+
+# --- Find Usages in all Modules ---------------------------------------------------
+
+
+def visible_webviews(hwnd: int) -> list[int]:
+    return [h for h in all_webviews(hwnd) if win32gui.IsWindowVisible(h)]
+
+
+def quick_search_edit(webview_hwnd: int) -> Any | None:
+    """The top-right quick-search box (Ctrl+F); the toolbox has another 'Search' box."""
+    try:
+        edits = [
+            e
+            for e in descendants_robust(
+                element_info(webview_hwnd), "Edit", ss.QUICK_SEARCH_EDIT_NAME
+            )
+            if _non_empty(e)
+        ]
+    except Exception:
+        return None
+    return max(edits, key=lambda e: _rect(e)[0]) if edits else None
+
+
+def quick_search_popup(webview_hwnd: int) -> ElementNode | None:
+    """Snapshot of the quick-search results popup, if it is open."""
+    try:
+        groups = [
+            g
+            for g in descendants_robust(element_info(webview_hwnd), "Group")
+            if str(g.name or "").startswith(ss.QUICK_SEARCH_GROUP_PREFIX) and _non_empty(g)
+        ]
+        if not groups:
+            return None
+        return ss.find_quick_search_popup(
+            snapshot_tree(groups[0], max_depth=4, max_elements=600, timeout_s=5)
+        )
+    except Exception:
+        return None
+
+
+def has_keyboard_focus(info: Any) -> bool:
+    try:
+        return bool(info.element.CurrentHasKeyboardFocus)
+    except Exception:
+        return False
+
+
+def element_tree_input(webview_hwnd: int) -> Any | None:
+    """The keyboard input of the visible elements tree (Interface/Logic/Data panel).
+
+    Chromium exposes the tree as a ``Tree`` whose only child is a hidden, focusable
+    ``Edit`` that receives the tree's keyboard input; the rows are plain ``Text``.
+    """
+    try:
+        trees = [t for t in descendants_robust(element_info(webview_hwnd), "Tree") if _non_empty(t)]
+        for tree in trees:
+            edits = [c for c in tree.children() if c.control_type == "Edit"]
+            if edits:
+                return edits[0]
+    except Exception:
+        return None
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class MenuEntry:
+    name: str
+    enabled: bool
+    focused: bool
+
+
+def context_menu_windows(pid: int) -> list[TopWindow]:
+    return [w for w in top_windows(pid) if w.uia_class == ss.CONTEXT_MENU_UIA_CLASS]
+
+
+def context_menu_entries(menu_hwnd: int) -> list[MenuEntry]:
+    try:
+        items = descendants_robust(element_info(menu_hwnd), "MenuItem")
+        return [MenuEntry(str(i.name or ""), bool(i.enabled), has_keyboard_focus(i)) for i in items]
+    except Exception:
+        return []
+
+
+def usages_panel(webview_hwnd: int) -> ss.UsagesPanel | None:
+    """Read the "'X' usages in all modules" panel from small subtree snapshots."""
+    try:
+        root = element_info(webview_hwnd)
+        tabs = [
+            t
+            for t in descendants_robust(root, "TabItem")
+            if ss.USAGES_TAB_AUTOMATION_ID_PART in str(t.automation_id or "")
+        ]
+        if not tabs:
+            return None
+        parts = [snapshot_tree(tabs[0], max_depth=3, max_elements=20, timeout_s=3)]
+        for table in descendants_robust(root, "Table"):
+            if any(h.name == "Module Name" for h in descendants_robust(table, "Header")):
+                parts.append(snapshot_tree(table, max_depth=6, max_elements=2000, timeout_s=10))
+                break
+        for text in descendants_robust(root, "Text"):
+            name = str(text.name or "")
+            if ss.USAGES_SUMMARY.match(name):
+                parts.append(ElementNode(control_type="Text", name=name))
+                break
+    except Exception:
+        return None
+    return ss.read_usages_panel(ElementNode(control_type="Group", children=parts))
+
+
+def usages_tab_close_buttons(webview_hwnd: int) -> list[Any]:
+    """'Close tab' buttons of existing "usages in all modules" panels."""
+    try:
+        tabs = [
+            t
+            for t in descendants_robust(element_info(webview_hwnd), "TabItem")
+            if ss.USAGES_TAB_AUTOMATION_ID_PART in str(t.automation_id or "")
+        ]
+        return [b for t in tabs for b in t.children() if b.control_type == "Button"]
+    except Exception:
+        return []

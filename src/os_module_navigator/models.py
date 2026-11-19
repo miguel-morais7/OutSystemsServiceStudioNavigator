@@ -96,3 +96,35 @@ class DependencyChangeResult(BaseModel):
         "'not_a_dependency' (remove: nothing to do)."
     )
     message: str
+
+
+class ModuleUsages(BaseModel):
+    module: str = Field(description="Consumer module name; '(local)' is the module itself.")
+    usages: int = Field(description="Number of usages; 0 for 'No usages'.")
+    usages_text: str = Field(description="As shown by Service Studio, e.g. '1 usage'.")
+
+
+class FindUsagesResult(BaseModel):
+    module_name: str
+    element_name: str
+    element_type: str | None = Field(
+        default=None, description="Type named by Service Studio, e.g. 'Block', 'Server Action'."
+    )
+    usages: list[ModuleUsages] = Field(
+        description="One row per module that references the element, as listed by Service "
+        "Studio. Consumers that only reference it (dead references) show 0."
+    )
+    modules_with_usages: list[str] = Field(
+        default_factory=list, description="Consumer modules (not '(local)') with usages > 0."
+    )
+    total_usages: int
+    summary: str | None = Field(
+        default=None,
+        description="Service Studio's footer, e.g. '2 usages found in 3 consumer modules'.",
+    )
+    other_matches: int = Field(
+        default=0,
+        description="Other quick-search results with the same name that were not used "
+        "(pass element_type to pick another one).",
+    )
+    message: str

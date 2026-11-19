@@ -23,6 +23,7 @@ from os_module_navigator.errors import (
     AmbiguousModuleError,
     DependencyElementNotFoundError,
     DependencyNotFoundError,
+    ElementNotFoundError,
     ModuleNotFoundInEnvironmentError,
     ModuleNotOpenError,
     NavigatorError,
@@ -31,6 +32,7 @@ from os_module_navigator.errors import (
 from os_module_navigator.models import (
     CloseModuleResult,
     DependencyChangeResult,
+    FindUsagesResult,
     ModuleInfo,
     OpenModuleResult,
     OpenModulesResult,
@@ -83,6 +85,19 @@ Manage Dependencies can take minutes to load ("Processing... 44%"): the tools wa
 for it to finish and never close it while it loads. Call ONE dependency tool at a
 time and wait for its result; never run two in parallel or retry while one is
 still running.
+FINDING USAGES IN ALL MODULES (the official MCP's Referrers only sees the open
+module): find_usages_all_modules(module_name, element_name, element_type=None)
+runs Service Studio's 'Find Usages in all Modules' (Ctrl+F12) on an element of
+an OPEN module (open_module first) and returns [{module, usages}] - '(local)' is
+the module itself, usages=0 ('No usages') means the consumer only keeps a dead
+reference. It returns counts only, not the exact places. Typical flow: call it,
+then for each name in modules_with_usages: get_open_modules / open_module, and
+use the official MCP's Referrers on the element there to get the exact nodes.
+Consumers are analysed as published on the server (they need not be open), so
+unpublished changes in a consumer are not seen. Pass element_type ('Block',
+'Server Action', ...) when names clash. It uses Ctrl+F, Shift+F10 and Enter
+in Service Studio: do not type in Service Studio while it runs, and call it
+one at a time.
 These tools never save or publish modules, and close only modules with
 no unsaved changes. open_module briefly brings Service Studio to the
 foreground and sends Up/Down keys to its search dialog, so avoid typing in
@@ -105,6 +120,8 @@ def to_tool_error(error: NavigatorError) -> ToolError:
         payload["suggestions"] = error.suggestions
     if isinstance(error, AmbiguousDependencyElementError):
         payload["candidates"] = error.candidates
+    if isinstance(error, ElementNotFoundError) and error.suggestions:
+        payload["suggestions"] = error.suggestions
     if isinstance(error, DependencyNotFoundError) and error.suggestions:
         payload["suggestions"] = error.suggestions
     if isinstance(error, AmbiguousDependencyError):
@@ -332,6 +349,54 @@ def build_server(service: ModuleService) -> FastMCP:
         or publish."""
         try:
             return await service.remove_dependency(module_name, dependency_name, elements)
+        except NavigatorError as error:
+            raise to_tool_error(error) from error
+
+    @mcp.tool(
+        annotations={
+            "title": "Find usages of an element in all modules",
+            "readOnlyHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def find_usages_all_modules(
+        module_name: Annotated[
+            str,
+            Field(
+                description="Exact name of the OPEN module that defines the element "
+                "(e.g. 'MR_CW'). Use open_module first.",
+                min_length=1,
+                max_length=200,
+            ),
+        ],
+        element_name: Annotated[
+            str,
+            Field(
+                description="Exact name of the element (block, screen, action, entity, "
+                "structure, ...), e.g. 'WB_AdditionalInfo_GeoLocation'.",
+                min_length=1,
+                max_length=200,
+            ),
+        ],
+        element_type: Annotated[
+            str | None,
+            Field(
+                description="Optional type as Service Studio names it ('Block', 'Screen', "
+                "'Server Action', 'Client Action', 'Entity', 'Structure', ...). Use it "
+                "when several elements share the name.",
+                max_length=100,
+            ),
+        ] = None,
+    ) -> FindUsagesResult:
+        """Run Service Studio's 'Find Usages in all Modules' (Ctrl+F12) on one element
+        of an open module and return the usages table: one row per module that
+        references it, with the number of usages ('(local)' is the module itself;
+        'No usages' = 0, i.e. a dead reference). modules_with_usages lists the
+        consumers with usages > 0: open those with open_module and use the official
+        MCP (Referrers) to find the exact places. Only counts are returned, not the
+        places. Takes a few seconds to a few minutes. Does not change anything."""
+        try:
+            return await service.find_usages_all_modules(module_name, element_name, element_type)
         except NavigatorError as error:
             raise to_tool_error(error) from error
 

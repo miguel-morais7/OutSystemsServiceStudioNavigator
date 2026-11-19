@@ -5,7 +5,7 @@ import pytest
 
 from os_module_navigator.automation import service_studio as ss
 from os_module_navigator.automation.driver import UiState
-from os_module_navigator.automation.live import DependencyCheckbox, DependencyRoot
+from os_module_navigator.automation.live import DependencyCheckbox, DependencyRoot, MenuEntry
 from os_module_navigator.config import NavigatorConfig
 from os_module_navigator.errors import (
     AmbiguousDependencyElementError,
@@ -15,6 +15,8 @@ from os_module_navigator.errors import (
     DependencyChangeFailedError,
     DependencyElementNotFoundError,
     DependencyNotFoundError,
+    ElementNotFoundError,
+    FindUsagesUnavailableError,
     ModuleNotFoundInEnvironmentError,
     ModuleNotOpenError,
     NavigatorError,
@@ -24,6 +26,7 @@ from os_module_navigator.errors import (
     UnexpectedDialogError,
     UnsavedChangesError,
     WrongDependencySelectedError,
+    WrongElementSelectedError,
     WrongModuleOpenedError,
 )
 from os_module_navigator.models import OpenStatus
@@ -827,3 +830,192 @@ def test_loading_that_never_finishes_times_out_with_a_clear_error():
         nav.change_dependency("M1", "OutSystemsUI", add=True)
     assert "still loading" in str(err.value)
     assert not driver.called("set_dependency_search")
+
+
+# --- Find Usages in all Modules ----------------------------------------------------
+class UsagesDriver(FakeDriver):
+    """Quick search + context menu + usages panel. ``elements`` is the module's
+    quick-search index: (category, name, type) in display order."""
+
+    def __init__(self, elements, tabs=None, **kwargs):
+        super().__init__(CATALOGUE, tabs or [ENV, editor("M1 (App)"), editor("M2 (App)", True)])
+        self.elements = elements
+        self.popup_open = False
+        self.query = ""
+        self.navigated = None
+        self.menu_open = False
+        self.panel = None
+        self.panel_reads_until_done = 1
+        self.usage_rows = [
+            ss.UsageRow(module="(local)", usages=1, usages_text="1 usage"),
+            ss.UsageRow(module="Consumer_CW", usages=2, usages_text="2 usages"),
+            ss.UsageRow(module="Dead_CW", usages=0, usages_text="No usages"),
+        ]
+        self.menu_without_find = False
+        self.panel_shows = None  # override the element name shown by the panel
+
+    def close_usages_panels(self):
+        self.calls.append(("close_usages_panels",))
+        self.panel = None
+        return 0
+
+    def open_quick_search(self):
+        self.calls.append(("open_quick_search",))
+        self.popup_open = True
+
+    def set_quick_search_text(self, text):
+        self.calls.append(("set_quick_search_text", text))
+        self.query = text
+        self.popup_open = True
+
+    def read_quick_search_results(self):
+        if not self.popup_open:
+            return None
+        needle = self.query.casefold()
+        return [
+            ss.QuickSearchResult(category=c, name=n)
+            for c, n, _ in self.elements
+            if needle in n.casefold()
+        ]
+
+    def open_quick_search_result(self, index, key_delay_s):
+        self.calls.append(("open_quick_search_result", index))
+        visible = [e for e in self.elements if self.query.casefold() in e[1].casefold()]
+        self.navigated = visible[index]
+        self.popup_open = False
+
+    def open_element_context_menu(self):
+        self.calls.append(("open_element_context_menu",))
+        self.menu_open = self.navigated is not None
+
+    def read_context_menu(self):
+        if not self.menu_open:
+            return []
+        names = ["Find Usages", "Rename", "Delete", f"Help with '{self.navigated[2]}'"]
+        if not self.menu_without_find:
+            names.insert(1, ss.FIND_USAGES_ALL_MODULES_ITEM)
+        return [MenuEntry(n, True, False) for n in names]
+
+    def run_context_menu_item(self, name, key_delay_s):
+        self.calls.append(("run_context_menu_item", name))
+        self.menu_open = False
+        self.panel = self.panel_shows or self.navigated[1]
+
+    def close_popups(self):
+        self.calls.append(("close_popups",))
+        self.popup_open = self.menu_open = False
+
+    def read_usages_panel(self):
+        if self.panel is None:
+            return None
+        if self.panel_reads_until_done > 0:
+            self.panel_reads_until_done -= 1
+            return ss.UsagesPanel(element_name=self.panel)
+        return ss.UsagesPanel(
+            element_name=self.panel,
+            rows=self.usage_rows,
+            summary="3 usages found in 3 consumer modules",
+        )
+
+
+ELEMENTS = [
+    ("Interface", "WB_Geo", "Block"),
+    ("Interface", "WB_GeoV2", "Block"),
+    ("Interface", "WB_Data", "UI Flow"),
+    ("Interface", "WB_Other", "Block"),
+    ("Interface", "WB_Data", "Block"),
+]
+
+
+def usages_nav(elements=ELEMENTS, **config):
+    driver = UsagesDriver(elements)
+    return driver, navigator(driver, **config)
+
+
+def test_find_usages_returns_the_table():
+    driver, nav = usages_nav()
+    result = nav.find_usages("m1", "WB_Geo")
+    assert result.module_name == "M1"
+    assert result.element_type == "Block"
+    assert [(u.module, u.usages) for u in result.usages] == [
+        ("(local)", 1),
+        ("Consumer_CW", 2),
+        ("Dead_CW", 0),
+    ]
+    assert result.modules_with_usages == ["Consumer_CW"]
+    assert result.total_usages == 3
+    assert result.summary == "3 usages found in 3 consumer modules"
+    assert result.other_matches == 0
+    # The module's tab was brought to the front and old panels were closed first.
+    assert driver.called("select_tab") == [("select_tab", 1)]
+    assert driver.calls.index(("close_usages_panels",)) < driver.calls.index(
+        ("open_quick_search_result", 0)
+    )
+    assert driver.called("run_context_menu_item") == [
+        ("run_context_menu_item", ss.FIND_USAGES_ALL_MODULES_ITEM)
+    ]
+
+
+def test_find_usages_requires_an_open_module():
+    _, nav = usages_nav()
+    with pytest.raises(ModuleNotOpenError) as err:
+        nav.find_usages("Nope", "WB_Geo")
+    assert err.value.open_modules == ["M1", "M2"]
+
+
+def test_find_usages_unknown_element_lists_suggestions_and_closes_popup():
+    driver, nav = usages_nav()
+    with pytest.raises(ElementNotFoundError) as err:
+        nav.find_usages("M1", "WB_Ge")
+    assert err.value.suggestions == ["WB_Geo", "WB_GeoV2"]
+    assert driver.called("close_popups")
+    assert not driver.called("open_quick_search_result")
+
+
+def test_find_usages_picks_the_requested_type_among_same_names():
+    driver, nav = usages_nav()
+    result = nav.find_usages("M1", "WB_Data", "block")
+    assert result.element_type == "Block"
+    assert result.other_matches == 1
+    # The UI Flow (first match) was checked and skipped, then the block was opened.
+    assert driver.called("open_quick_search_result") == [
+        ("open_quick_search_result", 0),
+        ("open_quick_search_result", 1),
+    ]
+
+
+def test_find_usages_without_type_uses_the_first_same_name_match():
+    _, nav = usages_nav(elements=[e for e in ELEMENTS if e[1] == "WB_Data"][::-1])
+    result = nav.find_usages("M1", "WB_Data")
+    assert result.element_type == "Block"
+    assert result.other_matches == 1
+
+
+def test_find_usages_type_not_found():
+    driver, nav = usages_nav()
+    with pytest.raises(ElementNotFoundError) as err:
+        nav.find_usages("M1", "WB_Geo", "Screen")
+    assert err.value.suggestions == ["Block"]
+    assert not driver.called("run_context_menu_item")
+
+
+def test_find_usages_unsupported_element_type_is_reported():
+    driver, nav = usages_nav()
+    driver.menu_without_find = True
+    with pytest.raises(FindUsagesUnavailableError):
+        nav.find_usages("M1", "WB_Geo")
+    assert driver.called("close_popups")
+
+
+def test_find_usages_panel_for_another_element_is_rejected():
+    driver, nav = usages_nav()
+    driver.panel_shows = "WB_Other"
+    with pytest.raises(WrongElementSelectedError):
+        nav.find_usages("M1", "WB_Geo")
+
+
+def test_find_usages_panel_that_never_finishes_times_out():
+    driver, nav = usages_nav(find_usages_timeout_s=5)
+    driver.panel_reads_until_done = 10_000
+    with pytest.raises(AutomationTimeoutError):
+        nav.find_usages("M1", "WB_Geo")

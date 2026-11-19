@@ -37,6 +37,8 @@ from os_module_navigator.errors import (
     DependencyChangeFailedError,
     DependencyElementNotFoundError,
     DependencyNotFoundError,
+    ElementNotFoundError,
+    FindUsagesUnavailableError,
     ModuleNotFoundInEnvironmentError,
     ModuleNotOpenError,
     NavigatorError,
@@ -47,12 +49,15 @@ from os_module_navigator.errors import (
     UnexpectedDialogError,
     UnsavedChangesError,
     WrongDependencySelectedError,
+    WrongElementSelectedError,
     WrongModuleOpenedError,
 )
 from os_module_navigator.models import (
     CloseModuleResult,
     DependencyChangeResult,
+    FindUsagesResult,
     ModuleInfo,
+    ModuleUsages,
     OpenModule,
     OpenModuleResult,
     OpenModulesResult,
@@ -93,6 +98,34 @@ def _module_tabs(state: UiState) -> list[tuple[int, ss.ShellTab, ss.ModuleCaptio
         if caption is not None:
             found.append((index, tab, caption))
     return found
+
+
+def _usages_result(
+    module_name: str, panel: ss.UsagesPanel, element_type: str | None, *, other_matches: int
+) -> FindUsagesResult:
+    rows = [
+        ModuleUsages(module=r.module, usages=r.usages, usages_text=r.usages_text)
+        for r in panel.rows
+    ]
+    consumers = [r.module for r in rows if r.module != ss.LOCAL_MODULE and r.usages > 0]
+    total = sum(r.usages for r in rows)
+    note = (
+        f" {other_matches} other element(s) with this name were not used; pass "
+        "element_type to choose."
+        if other_matches
+        else ""
+    )
+    return FindUsagesResult(
+        module_name=module_name,
+        element_name=panel.element_name,
+        element_type=element_type,
+        usages=rows,
+        modules_with_usages=consumers,
+        total_usages=total,
+        summary=panel.summary,
+        other_matches=other_matches,
+        message=f"{total} usage(s); {len(consumers)} consumer module(s) with usages.{note}",
+    )
 
 
 class DesktopGUINavigator:
@@ -608,6 +641,158 @@ class DesktopGUINavigator:
             message=f"{row_name!r} was {verb} the dependencies of {module_name!r}.{note}",
         )
 
+    # --- Find Usages in all Modules ---------------------------------------------
+    def find_usages(
+        self, module_name: str, element_name: str, element_type: str | None = None
+    ) -> FindUsagesResult:
+        """Run Service Studio's *Find Usages in all Modules* (Ctrl+F12) on one element.
+
+        1. Bring the (open) module's tab to the front.
+        2. Close old "usages in all modules" panels so a stale one is never read.
+        3. Quick search (Ctrl+F) for the name; open the exact-name result (Down/Enter).
+        4. Open the selected tree element's context menu (Shift+F10), read its type
+           from "Help with '<type>'", and run "Find Usages in all Modules".
+        5. Wait for the panel titled "'<name>' usages in all modules" and read it.
+
+        Read-only: nothing in the module is changed, saved or published.
+        """
+        module_name = self._validate(module_name, "Module name")
+        element_name = self._validate(element_name, "Element name")
+        wanted_type = self._validate(element_type, "Element type") if element_type else None
+        state = self._ready_state()
+        tabs = _module_tabs(state)
+        match = next((m for m in tabs if ss.same_module_name(m[2].name, module_name)), None)
+        if match is None:
+            raise ModuleNotOpenError(
+                f"No open module is named {module_name!r}. Open it with open_module first.",
+                open_modules=[c.name for _, _, c in tabs],
+            )
+        index, tab, caption = match
+        if not tab.selected:
+            self.driver.select_tab(index)
+            self._wait_tab_selected(caption.name)
+        try:
+            return self._find_usages(caption.name, element_name, wanted_type)
+        except BaseException:
+            self._close_popups_quietly()
+            raise
+
+    def _close_popups_quietly(self) -> None:
+        try:
+            self.driver.close_popups()
+        except NavigatorError:
+            log.warning("Could not close Service Studio's popup.")
+
+    def _quick_search(self, query: str) -> list[ss.QuickSearchResult]:
+        self.driver.open_quick_search()
+        self._sleep(self.config.poll_interval_s)
+        self.driver.set_quick_search_text(query)
+        needle = _normalize(query)
+        deadline = self._clock() + self.config.search_settle_timeout_s
+        previous: list[ss.QuickSearchResult] | None = None
+        stable = 0
+        reopened = False
+        while True:
+            self._sleep(self.config.poll_interval_s)
+            found = self.driver.read_quick_search_results()
+            if found is None and not reopened:
+                reopened = True
+                self.driver.open_quick_search()
+                continue
+            results = found or []
+            stable = stable + 1 if results == previous else 0
+            previous = results
+            if stable >= 1 and any(_normalize(r.name) == needle for r in results):
+                return results
+            if stable >= 3:
+                return results
+            if self._clock() > deadline:
+                raise AutomationTimeoutError("The quick-search results did not update in time.")
+
+    def _wait_context_menu(self) -> list[str]:
+        deadline = self._clock() + 5.0
+        while True:
+            self._sleep(self.config.poll_interval_s)
+            entries = self.driver.read_context_menu()
+            if entries:
+                return [e.name for e in entries if e.enabled]
+            if self._clock() > deadline:
+                raise FindUsagesUnavailableError(
+                    "The element's context menu did not open (is an element selected in "
+                    "the elements tree?)."
+                )
+
+    def _wait_usages_panel(self, element_name: str) -> ss.UsagesPanel:
+        deadline = self._clock() + self.config.find_usages_timeout_s
+        while True:
+            self._sleep(self.config.poll_interval_s)
+            panel = self.driver.read_usages_panel()
+            if panel is not None and panel.summary is not None:
+                if _normalize(panel.element_name) != _normalize(element_name):
+                    raise WrongElementSelectedError(
+                        f"Service Studio searched usages of {panel.element_name!r} instead of "
+                        f"{element_name!r}."
+                    )
+                return panel
+            unexpected = [
+                d for d in self.driver.read_state().dialogs if not ss.is_transient_dialog(d)
+            ]
+            if unexpected:
+                raise UnexpectedDialogError(
+                    f"Service Studio is showing a dialog ({unexpected[0]!r}) while finding "
+                    "usages. Please handle it in Service Studio."
+                )
+            if self._clock() > deadline:
+                raise AutomationTimeoutError(
+                    "The 'usages in all modules' panel did not finish in "
+                    f"{self.config.find_usages_timeout_s:.0f}s."
+                )
+
+    def _find_usages(
+        self, module_name: str, element_name: str, wanted_type: str | None
+    ) -> FindUsagesResult:
+        self.driver.close_usages_panels()
+        results = self._quick_search(element_name)
+        needle = _normalize(element_name)
+        exact = [i for i, r in enumerate(results) if _normalize(r.name) == needle]
+        if not exact:
+            self._close_popups_quietly()
+            raise ElementNotFoundError(
+                f"Quick search found no element named {element_name!r} in {module_name!r}.",
+                suggestions=list(dict.fromkeys(r.name for r in results))[:10],
+            )
+        seen_types: list[str] = []
+        for attempt, position in enumerate(exact):
+            if attempt:
+                results = self._quick_search(element_name)
+                if position >= len(results) or _normalize(results[position].name) != needle:
+                    break
+            self.driver.open_quick_search_result(position, self.config.key_delay_s)
+            self._sleep(self.config.poll_interval_s * 2)
+            self.driver.open_element_context_menu()
+            items = self._wait_context_menu()
+            found_type = ss.element_type_from_menu(items)
+            if wanted_type and _normalize(found_type or "") != _normalize(wanted_type):
+                seen_types.append(found_type or "unknown")
+                self._close_popups_quietly()
+                continue
+            if ss.FIND_USAGES_ALL_MODULES_ITEM not in items:
+                self._close_popups_quietly()
+                raise FindUsagesUnavailableError(
+                    "Service Studio offers no 'Find Usages in all Modules' for "
+                    f"{element_name!r} ({found_type or 'unknown type'})."
+                )
+            self.driver.run_context_menu_item(
+                ss.FIND_USAGES_ALL_MODULES_ITEM, self.config.key_delay_s
+            )
+            panel = self._wait_usages_panel(element_name)
+            return _usages_result(module_name, panel, found_type, other_matches=len(exact) - 1)
+        raise ElementNotFoundError(
+            f"No {wanted_type!r} named {element_name!r} was found in {module_name!r} "
+            f"(same-name elements found: {', '.join(seen_types) or 'none'}).",
+            suggestions=seen_types,
+        )
+
     def search(self, query: str) -> SearchResult:
         query = self._validate(query, "Query")
         state = self._ready_state()
@@ -759,6 +944,13 @@ class DesktopGUIProvider:
             lambda: self._navigator.change_dependency(
                 module_name, dependency_name, add=False, elements=elements
             )
+        )
+
+    async def find_usages_all_modules(
+        self, module_name: str, element_name: str, element_type: str | None = None
+    ) -> FindUsagesResult:
+        return await self._run(
+            lambda: self._navigator.find_usages(module_name, element_name, element_type)
         )
 
     def close(self) -> None:

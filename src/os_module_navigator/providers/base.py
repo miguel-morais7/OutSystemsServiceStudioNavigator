@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from os_module_navigator.models import (
     CloseModuleResult,
     DependencyChangeResult,
+    FindUsagesResult,
     OpenModuleResult,
     OpenModulesResult,
     SearchResult,
@@ -31,3 +32,6 @@ class ModuleProvider(Protocol):
     async def remove_dependency(
         self, module_name: str, dependency_name: str, elements: list[str] | None = None
     ) -> DependencyChangeResult: ...
+    async def find_usages_all_modules(
+        self, module_name: str, element_name: str, element_type: str | None = None
+    ) -> FindUsagesResult: ...

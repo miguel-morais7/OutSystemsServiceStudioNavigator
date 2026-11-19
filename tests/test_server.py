@@ -8,6 +8,7 @@ from fastmcp.exceptions import ToolError
 from os_module_navigator.errors import (
     AmbiguousModuleError,
     DependencyNotFoundError,
+    ElementNotFoundError,
     ModuleNotFoundInEnvironmentError,
     ServiceStudioNotRunningError,
     TooManyOpenModulesError,
@@ -16,7 +17,9 @@ from os_module_navigator.errors import (
 from os_module_navigator.models import (
     CloseModuleResult,
     DependencyChangeResult,
+    FindUsagesResult,
     ModuleInfo,
+    ModuleUsages,
     OpenModule,
     OpenModuleResult,
     OpenModulesResult,
@@ -89,6 +92,23 @@ class FakeProvider:
             message="ok",
         )
 
+    async def find_usages_all_modules(self, module_name, element_name, element_type=None):
+        self.calls.append(("find_usages", module_name, element_name, element_type))
+        if self.error:
+            raise self.error
+        return FindUsagesResult(
+            module_name=module_name,
+            element_name=element_name,
+            element_type=element_type,
+            usages=[
+                ModuleUsages(module="(local)", usages=1, usages_text="1 usage"),
+                ModuleUsages(module="Consumer_CW", usages=2, usages_text="2 usages"),
+            ],
+            modules_with_usages=["Consumer_CW"],
+            total_usages=3,
+            message="ok",
+        )
+
 
 def call(provider, tool, args=None):
     async def run():
@@ -118,7 +138,13 @@ def test_tools_are_listed_with_annotations():
         "close_module",
         "add_dependency",
         "remove_dependency",
+        "find_usages_all_modules",
     }
+    assert tools["find_usages_all_modules"].annotations.read_only_hint is True
+    assert tools["find_usages_all_modules"].input_schema["required"] == [
+        "module_name",
+        "element_name",
+    ]
     assert tools["get_open_modules"].annotations.read_only_hint is True
     assert tools["close_module"].input_schema["required"] == ["module_name"]
     assert tools["search_modules"].annotations.read_only_hint is True
@@ -242,3 +268,35 @@ def test_elements_are_passed_to_the_provider():
         {"module_name": "M1", "dependency_name": "Charts", "elements": ["DonutChart"]},
     )
     assert provider.calls == [("add_dependency", "M1", "Charts", ["DonutChart"])]
+
+
+def test_find_usages_all_modules_tool():
+    provider = FakeProvider()
+    result = call(
+        provider,
+        "find_usages_all_modules",
+        {"module_name": "MR_CW", "element_name": "WB_Geo", "element_type": "Block"},
+    )
+    assert provider.calls == [("find_usages", "MR_CW", "WB_Geo", "Block")]
+    assert result.structured_content["modules_with_usages"] == ["Consumer_CW"]
+    assert result.structured_content["usages"][0] == {
+        "module": "(local)",
+        "usages": 1,
+        "usages_text": "1 usage",
+    }
+
+
+def test_find_usages_element_not_found_carries_suggestions():
+    provider = FakeProvider(ElementNotFoundError("nope", suggestions=["WB_Geo2"]))
+    payload = error_payload(
+        provider, "find_usages_all_modules", {"module_name": "M", "element_name": "WB_Geo"}
+    )
+    assert payload["code"] == "element_not_found"
+    assert payload["suggestions"] == ["WB_Geo2"]
+
+
+def test_instructions_explain_find_usages():
+    server = build_server(ModuleService(FakeProvider()))
+    assert "find_usages_all_modules" in server.instructions
+    assert "Referrers" in server.instructions
+    assert "published" in server.instructions

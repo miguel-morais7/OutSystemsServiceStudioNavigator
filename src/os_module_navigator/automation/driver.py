@@ -15,6 +15,7 @@ from os_module_navigator.automation import actions, live
 from os_module_navigator.automation import service_studio as ss
 from os_module_navigator.errors import (
     DependenciesDialogUnavailableError,
+    FindUsagesUnavailableError,
     NavigatorError,
     SearchDialogUnavailableError,
     ServiceStudioNotRunningError,
@@ -57,6 +58,16 @@ class ServiceStudioDriver(Protocol):
     def press_dependencies_refresh_all(self) -> None: ...
     def dismiss_outdated_references_prompt(self) -> None: ...
     def cancel_dependencies_dialog(self) -> None: ...
+    def close_usages_panels(self) -> int: ...
+    def open_quick_search(self) -> None: ...
+    def set_quick_search_text(self, text: str) -> None: ...
+    def read_quick_search_results(self) -> list[ss.QuickSearchResult] | None: ...
+    def open_quick_search_result(self, index: int, key_delay_s: float) -> None: ...
+    def open_element_context_menu(self) -> None: ...
+    def read_context_menu(self) -> list[live.MenuEntry]: ...
+    def run_context_menu_item(self, name: str, key_delay_s: float) -> None: ...
+    def close_popups(self) -> None: ...
+    def read_usages_panel(self) -> ss.UsagesPanel | None: ...
 
 
 class LiveServiceStudioDriver:
@@ -426,3 +437,121 @@ class LiveServiceStudioDriver:
         if self._deps_dialog() is None:
             return
         actions.invoke(self._deps_element("Button", ss.CANCEL_BUTTON_NAME))
+
+    # --- Find Usages in all Modules ---------------------------------------------
+    def _editor_main(self) -> live.TopWindow:
+        """The main window whose selected tab is a module editor.
+
+        Retried briefly: right after a tab switch the shell's UIA tree can be incomplete.
+        """
+        for attempt in range(6):
+            for main in self._mains():
+                tabs = ss.read_shell_tabs(live.snapshot_shell(main.handle.hwnd))
+                if any(t.selected and t.kind is ss.ShellTabKind.MODULE_EDITOR for t in tabs):
+                    return main
+            if attempt < 5:
+                time.sleep(0.5)
+        raise FindUsagesUnavailableError("No module editor tab is in front.")
+
+    def _editor_webview(self) -> tuple[int, int]:
+        main = self._editor_main()
+        webviews = live.visible_webviews(main.handle.hwnd)
+        if not webviews:
+            raise FindUsagesUnavailableError("The module editor has no readable content.")
+        return main.handle.hwnd, webviews[0]
+
+    def _quick_search_edit(self, webview: int) -> Any:
+        edit = live.quick_search_edit(webview)
+        if edit is None:
+            raise FindUsagesUnavailableError("The quick-search box (Ctrl+F) was not found.")
+        return edit
+
+    def close_usages_panels(self) -> int:
+        _, webview = self._editor_webview()
+        buttons = live.usages_tab_close_buttons(webview)
+        for button in buttons:
+            actions.invoke(button)
+        return len(buttons)
+
+    def open_quick_search(self) -> None:
+        hwnd, _ = self._editor_webview()
+        actions.ensure_foreground(hwnd, live.element_info(hwnd))
+        actions.press_keys(hwnd, ["^f"])
+
+    def set_quick_search_text(self, text: str) -> None:
+        # Setting the value through UIA closes the popup but keeps the text;
+        # Ctrl+F then reopens it with the results for that text.
+        hwnd, webview = self._editor_webview()
+        actions.set_value(self._quick_search_edit(webview), text)
+        time.sleep(0.3)
+        actions.ensure_foreground(hwnd, live.element_info(hwnd))
+        actions.press_keys(hwnd, ["^f"])
+
+    def read_quick_search_results(self) -> list[ss.QuickSearchResult] | None:
+        _, webview = self._editor_webview()
+        popup = live.quick_search_popup(webview)
+        return None if popup is None else ss.parse_quick_search(popup)
+
+    def open_quick_search_result(self, index: int, key_delay_s: float) -> None:
+        hwnd, webview = self._editor_webview()
+        if live.quick_search_popup(webview) is None:
+            raise FindUsagesUnavailableError("The quick-search results closed unexpectedly.")
+        edit = self._quick_search_edit(webview)
+        if not live.has_keyboard_focus(edit):
+            raise FindUsagesUnavailableError("The quick-search box does not have the focus.")
+        # The first result is highlighted when the popup opens; Down moves to the next.
+        actions.press_keys(hwnd, ["{DOWN}"] * index, delay_s=key_delay_s)
+        actions.press_enter_on(hwnd, edit, delay_s=key_delay_s)
+
+    def open_element_context_menu(self) -> None:
+        hwnd, webview = self._editor_webview()
+        tree_input = live.element_tree_input(webview)
+        if tree_input is None:
+            raise FindUsagesUnavailableError("The elements tree was not found.")
+        actions.ensure_foreground(hwnd, live.element_info(hwnd))
+        actions.set_focus(tree_input)
+        actions.press_keys(hwnd, ["+{F10}"])
+
+    def _menu(self) -> live.TopWindow | None:
+        menus = live.context_menu_windows(self._pid())
+        return menus[0] if menus else None
+
+    def read_context_menu(self) -> list[live.MenuEntry]:
+        menu = self._menu()
+        return [] if menu is None else live.context_menu_entries(menu.handle.hwnd)
+
+    def run_context_menu_item(self, name: str, key_delay_s: float) -> None:
+        """Move the menu's keyboard focus to ``name`` with Down, verified each step, then Enter."""
+        menu = self._menu()
+        if menu is None:
+            raise FindUsagesUnavailableError("The context menu closed unexpectedly.")
+        entries = live.context_menu_entries(menu.handle.hwnd)
+        main_hwnd, _ = self._editor_webview()
+        for _ in range(len(entries) + 2):
+            focused = [e.name for e in live.context_menu_entries(menu.handle.hwnd) if e.focused]
+            if focused == [name]:
+                items = live.descendants_robust(
+                    live.element_info(menu.handle.hwnd), "MenuItem", name
+                )
+                if len(items) != 1:
+                    break
+                actions.press_enter_on(main_hwnd, items[0], delay_s=key_delay_s)
+                return
+            actions.press_keys(main_hwnd, ["{DOWN}"], delay_s=key_delay_s)
+        raise FindUsagesUnavailableError(f"Could not move to the menu item {name!r}.")
+
+    def close_popups(self) -> None:
+        try:
+            hwnd, webview = self._editor_webview()
+        except NavigatorError:
+            return
+        for _ in range(2):
+            if self._menu() is None and live.quick_search_popup(webview) is None:
+                return
+            if live.foreground_window() != hwnd:
+                return  # the popups close by themselves when Service Studio loses focus
+            actions.press_keys(hwnd, ["{ESC}"])
+
+    def read_usages_panel(self) -> ss.UsagesPanel | None:
+        _, webview = self._editor_webview()
+        return live.usages_panel(webview)
